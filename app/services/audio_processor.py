@@ -56,27 +56,35 @@ def process_audio(
     report(2, 30)
     if noise_gate:
         try:
+            import tempfile
             model, df_state = get_df()
 
-            # DeepFilterNet attend du 48kHz
-            audio_dfn, sr_dfn = load_audio(str(input_path), sr=df_state.sr())
+            # Convertit d'abord en WAV temporaire pour DeepFilterNet
+            # (load_audio ne supporte pas le m4a directement)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
 
-            # Traitement
+            sf.write(str(tmp_path), audio.T, sr, subtype="PCM_16")
+
+            # Resample à 48kHz attendu par DeepFilterNet
+            audio_dfn, sr_dfn = load_audio(str(tmp_path), sr=df_state.sr())
+            tmp_path.unlink(missing_ok=True)
+
+            # Traitement neural
             enhanced = enhance(model, df_state, audio_dfn)
 
-            # Resample vers sr original si différent
+            # Resample vers sr original
+            enhanced_np = enhanced.numpy()
             if sr_dfn != sr:
-                enhanced_np = enhanced.numpy()
-                enhanced_np = librosa.resample(enhanced_np, orig_sr=sr_dfn, target_sr=sr)
-                audio = enhanced_np
-            else:
-                audio = enhanced.numpy()
+                enhanced_np = librosa.resample(
+                    enhanced_np, orig_sr=sr_dfn, target_sr=sr
+                )
 
+            audio = enhanced_np
             if audio.ndim == 1:
                 audio = audio[np.newaxis, :]
 
         except Exception as e:
-            # Fallback silencieux si DeepFilterNet échoue
             import warnings
             warnings.warn(f"DeepFilterNet failed, skipping denoising: {e}")
 
