@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     ffmpeg \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pré-télécharge le modèle DeepFilterNet au build (pas au runtime)
-RUN python -c "from df.enhance import init_df; init_df()"
+RUN git init && python -c "from df.enhance import init_df; init_df()" && rm -rf .git
 
 COPY . .
 
