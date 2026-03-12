@@ -1,7 +1,3 @@
-# ─────────────────────────────────────────
-# SONOPRO — Schémas Pydantic
-# ─────────────────────────────────────────
-
 from pydantic import BaseModel
 from typing import Optional
 
@@ -12,8 +8,13 @@ class EnhanceResponse(BaseModel):
     format:   str
     bitDepth: int
 
-class ErrorResponse(BaseModel):
-    detail: str
+class JobStatus(BaseModel):
+    fileId:   str
+    step:     int
+    progress: float
+    done:     bool
+    error:    Optional[str]
+    duration: float
 
 class HealthResponse(BaseModel):
     status:  str
