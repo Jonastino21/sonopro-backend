@@ -8,10 +8,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 COPY requirements.txt .
-
-# Installe les dépendances sans deepfilternet
-RUN pip install --no-cache-dir -r requirements.txt \
-    --no-deps noisereduce==3.0.2 || pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
