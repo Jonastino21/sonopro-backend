@@ -1,9 +1,5 @@
-# ─────────────────────────────────────────
-# SONOPRO — Audio Processor (rapide)
-# Pipeline : EQ → compress → LUFS → WAV
-# ─────────────────────────────────────────
-
 from pathlib import Path
+import subprocess
 import numpy as np
 import soundfile as sf
 import pyloudnorm as pyln
@@ -21,33 +17,29 @@ def process_audio(
     use_compressor: bool = True,
     de_esser:       bool = True,
 ) -> float:
-    """
-    Pipeline rapide via pedalboard uniquement :
-      1. Lecture audio (pedalboard.io — supporte m4a/mp3/wav)
-      2. Highpass + Lowpass EQ
-      3. De-esser
-      4. Compression dynamique
-      5. Gain makeup
-      6. Normalisation LUFS (pyloudnorm)
-      7. Export WAV 24bit
-    """
     cfg = PRESETS.get(preset, PRESETS["podcast"])
 
-    # ── 1. Lecture avec pedalboard.io ──────
-    # Supporte m4a, mp3, wav, aac sans librosa
-    with AudioFile(str(input_path)) as f:
-        audio = f.read(f.frames)  # (channels, samples) float32
-        sr    = f.samplerate
+    # ── 1. Conversion en WAV mono 44100 via ffmpeg ──
+    wav_input = input_path.with_suffix('_input.wav')
+    subprocess.run([
+        'ffmpeg', '-y', '-i', str(input_path),
+        '-ar', '44100', '-ac', '1',
+        str(wav_input)
+    ], check=True, capture_output=True)
 
-    # ── 2-5. Chaîne pedalboard ─────────────
+    # ── 2. Lecture ──────────────────────────
+    with AudioFile(str(wav_input)) as f:
+        audio = f.read(f.frames)
+        sr    = f.samplerate
+    wav_input.unlink(missing_ok=True)
+
+    # ── 3. Chaîne pedalboard ────────────────
     chain = [
         HighpassFilter(cutoff_frequency_hz=float(cfg["highpass_hz"])),
         LowpassFilter(cutoff_frequency_hz=float(cfg["lowpass_hz"])),
     ]
-
     if de_esser:
         chain.append(LowpassFilter(cutoff_frequency_hz=7000.0))
-
     if use_compressor:
         chain.append(Compressor(
             threshold_db=cfg["compression_threshold_db"],
@@ -55,23 +47,21 @@ def process_audio(
             attack_ms=cfg["compression_attack_ms"],
             release_ms=cfg["compression_release_ms"],
         ))
-
     chain.append(Gain(gain_db=cfg["gain_db"]))
 
     board     = Pedalboard(chain)
-    processed = board(audio, sr)  # (channels, samples) float32
+    processed = board(audio, sr)
 
-    # ── 6. Normalisation LUFS ──────────────
+    # ── 4. Normalisation LUFS ───────────────
     meter      = pyln.Meter(sr)
-    audio_lufs = processed.T.astype(np.float64)  # (samples, channels)
+    audio_lufs = processed.T.astype(np.float64)
     loudness   = meter.integrated_loudness(audio_lufs)
-
     if np.isfinite(loudness):
         normalized = pyln.normalize.loudness(audio_lufs, loudness, cfg["target_lufs"])
     else:
         normalized = audio_lufs
 
-    # ── 7. Export WAV 24bit ────────────────
+    # ── 5. Export WAV 24bit ─────────────────
     sf.write(str(output_path), normalized, sr, subtype="PCM_24")
 
     return normalized.shape[0] / sr
