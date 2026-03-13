@@ -3,6 +3,7 @@ import subprocess
 import numpy as np
 import soundfile as sf
 import pyloudnorm as pyln
+import noisereduce as nr
 from pedalboard import Pedalboard, Compressor, HighpassFilter, LowpassFilter, Gain
 
 from app.core.config import PRESETS
@@ -18,24 +19,29 @@ def process_audio(
 ) -> float:
     cfg = PRESETS.get(preset, PRESETS["podcast"])
 
-    # ── 1. Conversion m4a/aac → WAV via ffmpeg ──
+    # ── 1. Conversion → WAV 44100 mono ─────────
     wav_input = output_path.parent / f"{input_path.stem}_tmp.wav"
     subprocess.run(
         ['ffmpeg', '-y', '-i', str(input_path), '-ar', '44100', '-ac', '1', str(wav_input)],
         check=True, capture_output=True
     )
 
-    # ── 2. Lecture soundfile → numpy (samples,) ──
+    # ── 2. Lecture ──────────────────────────────
     data, sr = sf.read(str(wav_input), dtype='float32')
     wav_input.unlink(missing_ok=True)
 
-    # Mono → (1, samples) pour pedalboard
-    if data.ndim == 1:
-        data = data[np.newaxis, :]
-    else:
-        data = data.T  # (channels, samples)
+    # ── 3. Débruitage IA (noisereduce) ──────────
+    if noise_gate:
+        data = nr.reduce_noise(
+            y=data, sr=sr,
+            stationary=False,
+            prop_decrease=0.85,
+        )
 
-    # ── 3. Chaîne pedalboard ────────────────────
+    # ── 4. Reshape pour pedalboard (1, samples) ─
+    audio = data[np.newaxis, :].astype(np.float32)
+
+    # ── 5. EQ + De-esser + Compression ─────────
     chain = [
         HighpassFilter(cutoff_frequency_hz=float(cfg["highpass_hz"])),
         LowpassFilter(cutoff_frequency_hz=float(cfg["lowpass_hz"])),
@@ -51,18 +57,16 @@ def process_audio(
         ))
     chain.append(Gain(gain_db=cfg["gain_db"]))
 
-    processed = Pedalboard(chain)(data, sr)  # (channels, samples)
+    processed = Pedalboard(chain)(audio, sr)  # (1, samples)
 
-    # ── 4. Normalisation LUFS ───────────────────
-    audio_lufs = processed.T.astype(np.float64)  # (samples, channels)
-    meter      = pyln.Meter(sr)
-    loudness   = meter.integrated_loudness(audio_lufs)
-
+    # ── 6. Normalisation LUFS -14 ───────────────
+    audio_lufs = processed.T.astype(np.float64)
+    loudness   = pyln.Meter(sr).integrated_loudness(audio_lufs)
     normalized = pyln.normalize.loudness(
         audio_lufs, loudness, cfg["target_lufs"]
     ) if np.isfinite(loudness) else audio_lufs
 
-    # ── 5. Export WAV 24bit ─────────────────────
+    # ── 7. Export WAV 24bit ─────────────────────
     sf.write(str(output_path), normalized, sr, subtype="PCM_24")
 
     return normalized.shape[0] / sr
