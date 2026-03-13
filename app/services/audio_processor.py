@@ -1,102 +1,78 @@
 # ─────────────────────────────────────────
 # SONOPRO — Service de traitement audio
-# Pipeline : DeepFilterNet → EQ → compress → LUFS
+# Pipeline : denoise → EQ → compress → LUFS
 # ─────────────────────────────────────────
 
 from pathlib import Path
-from typing import Callable, Optional
 import numpy as np
 import soundfile as sf
 import librosa
 import pyloudnorm as pyln
+from scipy.signal import butter, sosfilt
 from pedalboard import Pedalboard, Compressor, HighpassFilter, LowpassFilter, Gain
 
 from app.core.config import PRESETS
 
-# ── DeepFilterNet — init une seule fois ──
-import torch
-from df.enhance import enhance, init_df, load_audio, save_audio
-from df.utils import log as df_log
-import logging
-df_log.setLevel(logging.WARNING)  # silence les logs verbose
 
-_df_model  = None
-_df_state  = None
+def _spectral_denoise(audio: np.ndarray, sr: int, prop_decrease: float = 0.75) -> np.ndarray:
+    """
+    Débruitage spectral simple sans dépendance externe.
+    Estime le bruit sur les 0.5 premières secondes puis soustrait.
+    """
+    results = []
+    noise_frames = int(sr * 0.5)
 
-def get_df():
-    global _df_model, _df_state
-    if _df_model is None:
-        _df_model, _df_state, _ = init_df()
-    return _df_model, _df_state
+    for ch in audio:
+        stft = librosa.stft(ch)
+        mag, phase = np.abs(stft), np.angle(stft)
+
+        # Profil de bruit estimé sur les premières frames
+        noise_profile = np.mean(mag[:, :noise_frames], axis=1, keepdims=True)
+
+        # Soustraction spectrale
+        mag_clean = np.maximum(mag - prop_decrease * noise_profile, 0)
+        ch_clean  = librosa.istft(mag_clean * np.exp(1j * phase), length=len(ch))
+        results.append(ch_clean)
+
+    return np.stack(results)
 
 
 def process_audio(
-    input_path:        Path,
-    output_path:       Path,
-    preset:            str  = "podcast",
-    noise_gate:        bool = True,
-    use_compressor:    bool = True,
-    de_esser:          bool = True,
-    progress_callback: Optional[Callable[[int, float], None]] = None,
+    input_path:     Path,
+    output_path:    Path,
+    preset:         str  = "podcast",
+    noise_gate:     bool = True,
+    use_compressor: bool = True,
+    de_esser:       bool = True,
 ) -> float:
-
-    def report(step: int, progress: float):
-        if progress_callback:
-            progress_callback(step, progress)
-
+    """
+    Pipeline complet :
+      1. Chargement
+      2. Débruitage spectral (scipy + librosa)
+      3. Highpass + Lowpass EQ (pedalboard)
+      4. De-esser
+      5. Compression dynamique
+      6. Gain makeup
+      7. Normalisation LUFS (pyloudnorm)
+      8. Export WAV 24bit
+    """
     cfg = PRESETS.get(preset, PRESETS["podcast"])
 
     # ── 1. Chargement ──────────────────────
-    report(1, 15)
     audio, sr = librosa.load(str(input_path), sr=None, mono=False)
     if audio.ndim == 1:
-        audio = audio[np.newaxis, :]  # → (1, N)
+        audio = audio[np.newaxis, :]  # mono → (1, N)
 
-    # ── 2. DeepFilterNet — suppression bruit ─
-    report(2, 30)
+    # ── 2. Débruitage ──────────────────────
     if noise_gate:
-        try:
-            import tempfile
-            model, df_state = get_df()
+        audio = _spectral_denoise(audio, sr, prop_decrease=0.75)
 
-            # Convertit d'abord en WAV temporaire pour DeepFilterNet
-            # (load_audio ne supporte pas le m4a directement)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = Path(tmp.name)
-
-            sf.write(str(tmp_path), audio.T, sr, subtype="PCM_16")
-
-            # Resample à 48kHz attendu par DeepFilterNet
-            audio_dfn, sr_dfn = load_audio(str(tmp_path), sr=df_state.sr())
-            tmp_path.unlink(missing_ok=True)
-
-            # Traitement neural
-            enhanced = enhance(model, df_state, audio_dfn)
-
-            # Resample vers sr original
-            enhanced_np = enhanced.numpy()
-            if sr_dfn != sr:
-                enhanced_np = librosa.resample(
-                    enhanced_np, orig_sr=sr_dfn, target_sr=sr
-                )
-
-            audio = enhanced_np
-            if audio.ndim == 1:
-                audio = audio[np.newaxis, :]
-
-        except Exception as e:
-            import warnings
-            warnings.warn(f"DeepFilterNet failed, skipping denoising: {e}")
-
-    # ── 3. EQ ──────────────────────────────
-    report(3, 55)
+    # ── 3. EQ + 4. De-esser + 5. Compresseur ──
     chain = [
         HighpassFilter(cutoff_frequency_hz=float(cfg["highpass_hz"])),
         LowpassFilter(cutoff_frequency_hz=float(cfg["lowpass_hz"])),
     ]
 
-    # ── 4. De-esser + Compresseur ──────────
-    report(4, 75)
     if de_esser:
         chain.append(LowpassFilter(cutoff_frequency_hz=7000.0))
 
@@ -108,25 +84,23 @@ def process_audio(
             release_ms=cfg["compression_release_ms"],
         ))
 
+    # ── 6. Gain makeup ─────────────────────
     chain.append(Gain(gain_db=cfg["gain_db"]))
 
     board     = Pedalboard(chain)
     processed = board(audio.astype(np.float32), sr)
 
-    # ── 5. Normalisation LUFS + export ─────
-    report(5, 90)
+    # ── 7. Normalisation LUFS ──────────────
     meter      = pyln.Meter(sr)
     audio_lufs = processed.T.astype(np.float64)
     loudness   = meter.integrated_loudness(audio_lufs)
 
     if np.isfinite(loudness):
-        normalized = pyln.normalize.loudness(
-            audio_lufs, loudness, cfg["target_lufs"]
-        )
+        normalized = pyln.normalize.loudness(audio_lufs, loudness, cfg["target_lufs"])
     else:
         normalized = audio_lufs
 
+    # ── 8. Export WAV 24bit ────────────────
     sf.write(str(output_path), normalized, sr, subtype="PCM_24")
-    report(5, 100)
 
     return normalized.shape[0] / sr
